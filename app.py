@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import random
 from datetime import datetime, timedelta, timezone
 from flask import Flask, g, request, redirect, url_for, render_template_string, abort
 
@@ -23,6 +24,9 @@ def fmt_dt(dt_iso: str) -> str:
     return dt.strftime("%b %d, %Y %I:%M %p UTC")
 
 
+# -----------------------
+# Database helpers
+# -----------------------
 def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(DATABASE)
@@ -61,6 +65,26 @@ def init_db():
         UNIQUE(tournament_id, gamertag),
         FOREIGN KEY(tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS tournament_meta (
+        tournament_id INTEGER PRIMARY KEY,
+        generated_at_utc TEXT,
+        rounds INTEGER NOT NULL DEFAULT 5,
+        game_types TEXT NOT NULL DEFAULT 'Type A,Type B,Type C',
+        FOREIGN KEY(tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS matches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tournament_id INTEGER NOT NULL,
+        round_num INTEGER NOT NULL,
+        game_type TEXT NOT NULL,
+        team_a TEXT NOT NULL,
+        team_b TEXT NOT NULL,
+        winner TEXT,
+        created_at_utc TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY(tournament_id) REFERENCES tournaments(id) ON DELETE CASCADE
+    );
     """)
     db.commit()
 
@@ -70,6 +94,9 @@ def _startup():
     init_db()
 
 
+# -----------------------
+# Retro Space Invaders theme (CSS only)
+# -----------------------
 BASE_HTML = """
 <!doctype html>
 <html>
@@ -148,7 +175,7 @@ BASE_HTML = """
     }
 
     .wrap{
-      max-width: 860px;
+      max-width: 920px;
       margin: 44px auto;
       padding: 0 16px 50px 16px;
       position: relative;
@@ -248,6 +275,7 @@ BASE_HTML = """
       padding: 2px 6px;
       border-radius: 8px;
       color: var(--accent2);
+      word-break: break-all;
     }
 
     .hr{
@@ -302,9 +330,7 @@ BASE_HTML = """
       color: rgba(215,255,231,0.90);
     }
 
-    a{
-      color: var(--accent2);
-    }
+    a{ color: var(--accent2); }
   </style>
 </head>
 
@@ -330,6 +356,9 @@ def registration_open(tournament_row) -> bool:
     return utc_now() <= deadline
 
 
+# -----------------------
+# Registration routes
+# -----------------------
 @app.get("/")
 def home():
     return render_page(
@@ -421,11 +450,10 @@ def join_page(code):
             """,
         )
 
-    days = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
-    day_checks = "".join([
-        f'<label class="day"><input type="checkbox" name="days" value="{d}"> {d}</label>'
-        for d in days
-    ])
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    day_checks = "".join(
+        [f'<label class="day"><input type="checkbox" name="days" value="{d}"> {d}</label>' for d in days]
+    )
 
     time_windows = ["6pm-8pm", "7pm-9pm", "8pm-10pm", "8pm-11pm", "9pm-11pm"]
     time_options = "".join([f'<option value="{tw}">{tw} ET</option>' for tw in time_windows])
@@ -524,6 +552,157 @@ def join_submit(code):
     return redirect(url_for("join_page", code=code))
 
 
+# -----------------------
+# Tournament generation + viewing
+# -----------------------
+def split_teams(players6):
+    team_a = players6[:3]
+    team_b = players6[3:]
+    return team_a, team_b
+
+
+@app.post("/admin/<code>/generate")
+def generate_tournament(code):
+    db = get_db()
+    t = db.execute("SELECT * FROM tournaments WHERE code = ?", (code.upper(),)).fetchone()
+    if not t:
+        abort(404)
+
+    players = db.execute(
+        "SELECT gamertag FROM players WHERE tournament_id = ? ORDER BY created_at_utc ASC",
+        (t["id"],)
+    ).fetchall()
+    gamertags = [p["gamertag"] for p in players]
+
+    if len(gamertags) < 6:
+        return render_page(
+            f"Admin: {t['name']}",
+            "Not enough players yet.",
+            f"""
+            <p class="closed"><b>Need at least 6 players</b> to generate a 3v3 tournament. Currently: {len(gamertags)}</p>
+            <p><a href="{url_for('admin_tournament', code=code)}">Back</a></p>
+            """,
+        )
+
+    meta = db.execute("SELECT * FROM tournament_meta WHERE tournament_id = ?", (t["id"],)).fetchone()
+    if meta and meta["generated_at_utc"]:
+        return redirect(url_for("tournament_view", code=code.upper()))
+
+    if not meta:
+        db.execute("INSERT INTO tournament_meta (tournament_id) VALUES (?)", (t["id"],))
+        db.commit()
+
+    meta = db.execute("SELECT * FROM tournament_meta WHERE tournament_id = ?", (t["id"],)).fetchone()
+    rounds = int(meta["rounds"])
+    game_types = [x.strip() for x in meta["game_types"].split(",") if x.strip()]
+    if not game_types:
+        game_types = ["Type A", "Type B", "Type C"]
+
+    db.execute("DELETE FROM matches WHERE tournament_id = ?", (t["id"],))
+    db.commit()
+
+    for r in range(1, rounds + 1):
+        picked = gamertags[:]
+        random.shuffle(picked)
+        players6 = picked[:6]
+        team_a, team_b = split_teams(players6)
+        game_type = game_types[(r - 1) % len(game_types)]
+
+        db.execute(
+            """
+            INSERT INTO matches (tournament_id, round_num, game_type, team_a, team_b, winner)
+            VALUES (?, ?, ?, ?, ?, NULL)
+            """,
+            (t["id"], r, game_type, ",".join(team_a), ",".join(team_b))
+        )
+
+    db.execute(
+        "UPDATE tournament_meta SET generated_at_utc = ? WHERE tournament_id = ?",
+        (utc_now().isoformat(), t["id"])
+    )
+    db.commit()
+
+    return redirect(url_for("tournament_view", code=code.upper()))
+
+
+@app.get("/t/<code>")
+def tournament_view(code):
+    db = get_db()
+    t = db.execute("SELECT * FROM tournaments WHERE code = ?", (code.upper(),)).fetchone()
+    if not t:
+        abort(404)
+
+    meta = db.execute("SELECT * FROM tournament_meta WHERE tournament_id = ?", (t["id"],)).fetchone()
+    if not meta or not meta["generated_at_utc"]:
+        return render_page(
+            f"Tournament: {t['name']}",
+            "Tournament not generated yet.",
+            f"<p><a href='{url_for('admin_tournament', code=code)}'>Go to Admin</a></p>"
+        )
+
+    matches = db.execute(
+        "SELECT * FROM matches WHERE tournament_id = ? ORDER BY round_num ASC",
+        (t["id"],)
+    ).fetchall()
+
+    def fmt_team(s):
+        return " vs ".join([x.strip() for x in s.split(",")])
+
+    rows = ""
+    for m in matches:
+        winner = m["winner"] or "—"
+        rows += f"""
+          <div>
+            <b>Round {m['round_num']}</b> <span class="muted">({m['game_type']})</span><br>
+            <span class="muted">Team A:</span> {fmt_team(m['team_a'])}<br>
+            <span class="muted">Team B:</span> {fmt_team(m['team_b'])}<br>
+            <span class="muted">Winner:</span> <b>{winner}</b>
+            <form method="post" action="{url_for('set_winner', code=code, match_id=m['id'])}" style="margin-top:8px;">
+              <select name="winner" required>
+                <option value="">Set winner…</option>
+                <option value="A">Team A</option>
+                <option value="B">Team B</option>
+              </select>
+              <button type="submit">Save Winner</button>
+            </form>
+          </div>
+          <div class="hr"></div>
+        """
+
+    return render_page(
+        f"Tournament: {t['name']}",
+        "Rounds generated. Record match winners below.",
+        f"""
+        <p><a href="{url_for('admin_tournament', code=code)}">Back to Admin</a></p>
+        <div class="hr"></div>
+        {rows}
+        """
+    )
+
+
+@app.post("/t/<code>/match/<int:match_id>/winner")
+def set_winner(code, match_id):
+    winner = request.form.get("winner", "").strip().upper()
+    if winner not in ("A", "B"):
+        abort(400)
+
+    db = get_db()
+    t = db.execute("SELECT * FROM tournaments WHERE code = ?", (code.upper(),)).fetchone()
+    if not t:
+        abort(404)
+
+    db.execute(
+        "UPDATE matches SET winner = ? WHERE id = ? AND tournament_id = ?",
+        (winner, match_id, t["id"])
+    )
+    db.commit()
+
+    return redirect(url_for("tournament_view", code=code.upper()))
+
+
+# -----------------------
+# Admin
+# -----------------------
 @app.get("/admin/<code>")
 def admin_tournament(code):
     db = get_db()
@@ -542,6 +721,7 @@ def admin_tournament(code):
     ).fetchall()
 
     join_link = url_for("join_page", code=code.upper(), _external=True)
+    tournament_link = url_for("tournament_view", code=code.upper(), _external=True)
     deadline_text = fmt_dt(t["registration_deadline_utc"])
     open_now = registration_open(t)
 
@@ -555,15 +735,33 @@ def admin_tournament(code):
     else:
         rows = "<li>No players yet</li>"
 
+    meta = db.execute("SELECT * FROM tournament_meta WHERE tournament_id = ?", (t["id"],)).fetchone()
+    generated = bool(meta and meta["generated_at_utc"])
+
     status_html = (
         f"<div class='warning'><b>Registration OPEN</b><br>Closes at: <code>{deadline_text}</code></div>"
         if open_now
         else f"<div class='closed'><b>Registration CLOSED</b><br>Closed at: <code>{deadline_text}</code></div>"
     )
 
+    if generated:
+        gen_block = f"""
+        <div class="success">
+          <b>Tournament generated.</b><br>
+          Tournament page: <code>{tournament_link}</code>
+        </div>
+        """
+    else:
+        gen_block = f"""
+        <form method="post" action="{url_for('generate_tournament', code=code)}">
+          <button type="submit">Generate Tournament</button>
+        </form>
+        <p class="muted">Tournament page will appear here after generation.</p>
+        """
+
     return render_page(
         f"Admin: {t['name']}",
-        "Copy the join link and share it with players.",
+        "Copy the join link and share it with players. Generate tournament when ready.",
         f"""
         {status_html}
 
@@ -574,9 +772,13 @@ def admin_tournament(code):
 
         <div class="hr"></div>
 
+        {gen_block}
+
+        <div class="hr"></div>
+
         <h3>Registered Players ({len(players)})</h3>
         <ul>{rows}</ul>
-        """,
+        """
     )
 
 
