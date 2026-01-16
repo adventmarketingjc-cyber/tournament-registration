@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: tournament-registration
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE
+        value: /var/data/tournament.db
+    disk:
+      name: data
+      mountPath: /var/data
+      sizeGB: 1
