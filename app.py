@@ -455,13 +455,8 @@ def join_page(code):
         [f'<label class="day"><input type="checkbox" name="days" value="{d}"> {d}</label>' for d in days]
     )
 
- time_windows = ["6pm-9pm", "9pm-12am", "12am-3am"]
-
-time_checks = "".join([
-    f'<label class="day"><input type="checkbox" name="time_windows" value="{tw}"> {tw} ET</label>'
-    for tw in time_windows
-])
-
+    time_windows = ["6pm-8pm", "7pm-9pm", "8pm-10pm", "8pm-11pm", "9pm-11pm"]
+    time_options = "".join([f'<option value="{tw}">{tw} ET</option>' for tw in time_windows])
 
     return render_page(
         f"Join: {t['name']}",
@@ -488,12 +483,11 @@ time_checks = "".join([
             </div>
 
             <div>
-              <label>Time Windows (ET)</label>
-<div class="days-box">
-  {time_checks}
-</div>
-<p class="muted" style="margin-top:8px;">Pick all that apply.</p>
-
+              <label>Time Window (ET)</label>
+              <select name="time_window" required>
+                <option value="">-- select --</option>
+                {time_options}
+              </select>
 
               <label>Notes (optional)</label>
               <input name="notes" placeholder="Example: Every other Wednesday">
@@ -515,15 +509,15 @@ time_checks = "".join([
 def join_submit(code):
     gamertag = request.form.get("gamertag", "").strip()
     days = request.form.getlist("days")
-    time_windows = request.form.getlist("time_windows")
+    time_window = request.form.get("time_window", "").strip()
     notes = request.form.get("notes", "").strip()
 
     if not gamertag:
         abort(400, "Gamertag is required.")
     if not days:
         abort(400, "Please select at least one day.")
-    if not time_windows:
-    abort(400, "Please select at least one time window.")
+    if not time_window:
+        abort(400, "Please select a time window.")
 
     db = get_db()
     t = db.execute("SELECT * FROM tournaments WHERE code = ?", (code.upper(),)).fetchone()
@@ -534,8 +528,6 @@ def join_submit(code):
         return render_page("Registration Closed", "", "<p class='closed'><b>Registration is closed.</b></p>")
 
     availability_days = ",".join(days)
-    availability_windows = ",".join(time_windows)
-
 
     try:
         db.execute(
@@ -544,7 +536,7 @@ def join_submit(code):
               (tournament_id, gamertag, availability_days, availability_window, availability_notes, created_at_utc)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (t["id"], gamertag, availability_windows, time_window, notes, utc_now().isoformat()),
+            (t["id"], gamertag, availability_days, time_window, notes, utc_now().isoformat()),
         )
         db.commit()
     except sqlite3.IntegrityError:
